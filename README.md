@@ -8,10 +8,17 @@ cargo run -- c
 cargo run -- 'f#'
 cargo run -- bb3
 cargo run -- a4
+cargo run -- midi
 ```
 
 Notes without an octave default to octave 4. Note names are case-insensitive;
 use `#` for sharps and `b` for flats.
+
+MIDI mode automatically connects to the primary musical input on an AKAI MPK
+when available (or to the only MIDI input device), plays notes while their
+keys are held, and exits with Ctrl+C. Notes use short attack and release
+envelopes to avoid clicks. If there are multiple MIDI inputs and no AKAI input
+is detected, the available device names are shown in the error message.
 
 ## Development
 
