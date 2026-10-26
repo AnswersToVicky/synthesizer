@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -14,6 +14,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     FromSample, Sample, SampleFormat, SizedSample,
 };
+use eframe::egui;
 use midir::{Ignore, MidiInput};
 
 const DURATION_SECONDS: usize = 2;
@@ -21,6 +22,14 @@ const MIDI_ATTACK_SECONDS: f32 = 0.005;
 const MIDI_RELEASE_SECONDS: f32 = 0.03;
 const USAGE: &str =
     "Usage: synthesizer <note> | synthesizer midi\nExamples: synthesizer c, synthesizer 'f#', synthesizer midi";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Waveform {
+    Sine,
+    Sawtooth,
+    Pulse,
+}
 
 #[derive(Clone, Copy)]
 struct ToneParameters {
@@ -39,6 +48,115 @@ impl MidiVoices {
         Self {
             velocities: std::array::from_fn(|_| AtomicU8::new(0)),
         }
+    }
+}
+
+struct MidiGui {
+    waveform: Waveform,
+    selected_waveform: Arc<AtomicU8>,
+    volume_percent: f32,
+    volume: Arc<AtomicU32>,
+    callback_failed: Arc<AtomicBool>,
+    should_exit: Arc<AtomicBool>,
+}
+
+impl MidiGui {
+    fn new(
+        selected_waveform: Arc<AtomicU8>,
+        volume: Arc<AtomicU32>,
+        callback_failed: Arc<AtomicBool>,
+        should_exit: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            waveform: Waveform::Sine,
+            selected_waveform,
+            volume_percent: 100.0,
+            volume,
+            callback_failed,
+            should_exit,
+        }
+    }
+
+    fn select_waveform(&mut self, waveform: Waveform) {
+        self.waveform = waveform;
+        self.selected_waveform
+            .store(waveform as u8, Ordering::Release);
+    }
+}
+
+impl eframe::App for MidiGui {
+    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.callback_failed.load(Ordering::Acquire) || self.should_exit.load(Ordering::Acquire)
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        egui::CentralPanel::default().show(context, |ui| {
+            ui.heading("MIDI Oscillator");
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(48.0, 150.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label("Volume");
+                        if ui
+                            .add_sized(
+                                [24.0, 100.0],
+                                egui::Slider::new(&mut self.volume_percent, 0.0..=100.0)
+                                    .vertical()
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            self.volume
+                                .store((self.volume_percent / 100.0).to_bits(), Ordering::Release);
+                        }
+                        ui.label(format!("{:.0}%", self.volume_percent));
+                    },
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(320.0, 150.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label("Choose a waveform:");
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_sized(
+                                    [100.0, 36.0],
+                                    egui::Button::new("Sine")
+                                        .selected(self.waveform == Waveform::Sine),
+                                )
+                                .clicked()
+                            {
+                                self.select_waveform(Waveform::Sine);
+                            }
+                            if ui
+                                .add_sized(
+                                    [100.0, 36.0],
+                                    egui::Button::new("Sawtooth")
+                                        .selected(self.waveform == Waveform::Sawtooth),
+                                )
+                                .clicked()
+                            {
+                                self.select_waveform(Waveform::Sawtooth);
+                            }
+                            if ui
+                                .add_sized(
+                                    [100.0, 36.0],
+                                    egui::Button::new("Pulse")
+                                        .selected(self.waveform == Waveform::Pulse),
+                                )
+                                .clicked()
+                            {
+                                self.select_waveform(Waveform::Pulse);
+                            }
+                        });
+                    },
+                );
+            });
+        });
     }
 }
 
@@ -172,23 +290,46 @@ fn play_midi() -> Result<(), Box<dyn Error>> {
     let sample_rate = config.sample_rate().0 as usize;
     let channels = config.channels() as usize;
     let callback_failed = Arc::new(AtomicBool::new(false));
+    let selected_waveform = Arc::new(AtomicU8::new(Waveform::Sine as u8));
+    let volume = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
     let stream = build_midi_stream(
         &device,
         config,
         channels,
         sample_rate,
         Arc::clone(&voices),
+        Arc::clone(&selected_waveform),
+        Arc::clone(&volume),
         Arc::clone(&callback_failed),
     )?;
+
+    stream.play()?;
+    println!("MIDI input: {port_name}. Play notes; close the window to exit.");
     let should_exit = Arc::new(AtomicBool::new(false));
     let exit_flag = Arc::clone(&should_exit);
     ctrlc::set_handler(move || exit_flag.store(true, Ordering::Release))?;
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([440.0, 180.0])
+            .with_min_inner_size([440.0, 180.0]),
+        ..Default::default()
+    };
+    let callback_failed_for_gui = Arc::clone(&callback_failed);
+    let should_exit_for_gui = Arc::clone(&should_exit);
+    let volume_for_gui = Arc::clone(&volume);
+    eframe::run_native(
+        "MIDI Synthesizer",
+        options,
+        Box::new(move |_creation_context| {
+            Ok(Box::new(MidiGui::new(
+                selected_waveform,
+                volume_for_gui,
+                callback_failed_for_gui,
+                should_exit_for_gui,
+            )))
+        }),
+    )?;
 
-    stream.play()?;
-    println!("MIDI input: {port_name}. Play notes; press Ctrl+C to exit.");
-    while !should_exit.load(Ordering::Acquire) && !callback_failed.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(10));
-    }
     if callback_failed.load(Ordering::Acquire) {
         return Err("audio playback failed".into());
     }
@@ -204,6 +345,8 @@ fn build_midi_stream(
     channels: usize,
     sample_rate: usize,
     voices: Arc<MidiVoices>,
+    selected_waveform: Arc<AtomicU8>,
+    volume: Arc<AtomicU32>,
     callback_failed: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, Box<dyn Error>> {
     let failure_for_callback = Arc::clone(&callback_failed);
@@ -218,6 +361,8 @@ fn build_midi_stream(
             channels,
             sample_rate,
             voices,
+            selected_waveform,
+            volume,
             error_handler,
         ),
         SampleFormat::I16 => build_midi_stream_for_sample::<i16>(
@@ -226,6 +371,8 @@ fn build_midi_stream(
             channels,
             sample_rate,
             voices,
+            selected_waveform,
+            volume,
             error_handler,
         ),
         SampleFormat::U16 => build_midi_stream_for_sample::<u16>(
@@ -234,6 +381,8 @@ fn build_midi_stream(
             channels,
             sample_rate,
             voices,
+            selected_waveform,
+            volume,
             error_handler,
         ),
         format => Err(format!("unsupported audio sample format: {format:?}").into()),
@@ -246,6 +395,8 @@ fn build_midi_stream_for_sample<T>(
     channels: usize,
     sample_rate: usize,
     voices: Arc<MidiVoices>,
+    selected_waveform: Arc<AtomicU8>,
+    volume: Arc<AtomicU32>,
     error_handler: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, Box<dyn Error>>
 where
@@ -261,6 +412,8 @@ where
                 channels,
                 sample_rate,
                 &voices,
+                &selected_waveform,
+                &volume,
                 &mut phases,
                 &mut envelopes,
             );
@@ -276,6 +429,8 @@ fn write_midi_samples<T>(
     channels: usize,
     sample_rate: usize,
     voices: &MidiVoices,
+    selected_waveform: &AtomicU8,
+    volume: &AtomicU32,
     phases: &mut [f32; 128],
     envelopes: &mut [f32; 128],
 ) where
@@ -283,9 +438,15 @@ fn write_midi_samples<T>(
 {
     let attack_step = 1.0 / (sample_rate as f32 * MIDI_ATTACK_SECONDS);
     let release_step = 1.0 / (sample_rate as f32 * MIDI_RELEASE_SECONDS);
+    let volume = f32::from_bits(volume.load(Ordering::Acquire));
     for frame in output.chunks_mut(channels) {
         let mut mixed_sample = 0.0;
         let mut active_voices = 0;
+        let waveform = match selected_waveform.load(Ordering::Acquire) {
+            value if value == Waveform::Sawtooth as u8 => Waveform::Sawtooth,
+            value if value == Waveform::Pulse as u8 => Waveform::Pulse,
+            _ => Waveform::Sine,
+        };
         for (note, (phase, envelope)) in phases.iter_mut().zip(envelopes.iter_mut()).enumerate() {
             let velocity = voices.velocities[note].load(Ordering::Acquire);
             let target = velocity as f32 / 127.0;
@@ -296,7 +457,7 @@ fn write_midi_samples<T>(
             };
             *envelope = move_envelope_towards(*envelope, target, step);
             let frequency = midi_note_frequency(note as u8);
-            mixed_sample += phase.sin() * *envelope;
+            mixed_sample += waveform_sample(*phase, waveform) * *envelope;
             *phase = (*phase + std::f32::consts::TAU * frequency / sample_rate as f32)
                 % std::f32::consts::TAU;
             if *envelope > 0.0 {
@@ -304,11 +465,26 @@ fn write_midi_samples<T>(
             }
         }
         if active_voices > 0 {
-            mixed_sample *= 0.2 / (active_voices as f32).sqrt();
+            mixed_sample *= 0.2 * volume / (active_voices as f32).sqrt();
         }
 
         for sample in frame {
             *sample = T::from_sample(mixed_sample);
+        }
+    }
+}
+
+fn waveform_sample(phase: f32, waveform: Waveform) -> f32 {
+    let cycle = phase / std::f32::consts::TAU;
+    match waveform {
+        Waveform::Sine => phase.sin(),
+        Waveform::Sawtooth => 1.0 - 4.0 * (cycle - 0.5).abs(),
+        Waveform::Pulse => {
+            if cycle < 0.5 {
+                1.0
+            } else {
+                -1.0
+            }
         }
     }
 }
@@ -481,7 +657,7 @@ fn main() {
 mod tests {
     use super::{
         handle_midi_message, midi_note_frequency, move_envelope_towards, note_frequency,
-        select_midi_port, MidiVoices,
+        select_midi_port, waveform_sample, MidiVoices, Waveform,
     };
 
     #[test]
@@ -508,6 +684,16 @@ mod tests {
     fn midi_note_numbers_use_a440_tuning() {
         assert!((midi_note_frequency(69) - 440.0).abs() < 0.001);
         assert!((midi_note_frequency(60) - note_frequency("c").unwrap()).abs() < 0.001);
+    }
+
+    #[test]
+    fn oscillator_waveforms_have_expected_shapes() {
+        let quarter_cycle = std::f32::consts::FRAC_PI_2;
+        assert!((waveform_sample(quarter_cycle, Waveform::Sine) - 1.0).abs() < 0.001);
+        assert!((waveform_sample(0.0, Waveform::Sawtooth) + 1.0).abs() < 0.001);
+        assert!((waveform_sample(std::f32::consts::PI, Waveform::Sawtooth) - 1.0).abs() < 0.001);
+        assert_eq!(waveform_sample(0.0, Waveform::Pulse), 1.0);
+        assert_eq!(waveform_sample(std::f32::consts::PI, Waveform::Pulse), -1.0);
     }
 
     #[test]
